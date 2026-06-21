@@ -19,11 +19,13 @@ def clean_amount(amount_str: str) -> Decimal:
     if not amount_str:
         raise CleaningError("Amount is missing or empty")
     
-    # Strip spaces and commas
-    cleaned = amount_str.strip().replace(",", "")
+    # Convert to string and strip spaces/commas
+    cleaned = str(amount_str).strip().replace(",", "")
+    
+    # Strip symbols: $, Rs., INR (case-insensitive)
+    cleaned = re.sub(r'(?i)\$|rs\.?|inr', '', cleaned).strip()
     
     # Find the decimal number inside the string
-    # Supports negative numbers (optional minus sign), digits, and optional decimal point
     match = re.search(r'-?\d+(?:\.\d+)?', cleaned)
     if not match:
         raise CleaningError(f"Could not extract numeric amount from: {amount_str}")
@@ -37,7 +39,7 @@ def clean_date(date_str: str) -> str:
     if not date_str:
         raise CleaningError("Date is missing or empty")
         
-    cleaned = date_str.strip()
+    cleaned = str(date_str).strip()
     
     # Try the standard formats
     for fmt in DATE_FORMATS:
@@ -57,15 +59,15 @@ def clean_records(raw_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for record in raw_records:
         # Create a representation of all field values in order
         key = (
-            record.get("txn_id", ""),
-            record.get("date", ""),
-            record.get("merchant", ""),
-            record.get("amount", ""),
-            record.get("currency", ""),
-            record.get("status", ""),
-            record.get("category", ""),
-            record.get("account_id", ""),
-            record.get("notes", "")
+            str(record.get("txn_id", "")).strip(),
+            str(record.get("date", "")).strip(),
+            str(record.get("merchant", "")).strip(),
+            str(record.get("amount", "")).strip(),
+            str(record.get("currency", "")).strip(),
+            str(record.get("status", "")).strip(),
+            str(record.get("category", "")).strip(),
+            str(record.get("account_id", "")).strip(),
+            str(record.get("notes", "")).strip()
         )
         if key not in seen:
             seen.add(key)
@@ -74,17 +76,19 @@ def clean_records(raw_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     cleaned_records = []
     for r in deduplicated:
         try:
-            # Clean and normalize fields
+            # Clean and normalize fields, preserving raw inputs for model auditing
             cleaned_rec = {
-                "txn_id": r.get("txn_id", "").strip() or None,  # Keep nullable/empty
+                "txn_id": str(r.get("txn_id", "")).strip() or None,
+                "raw_date": str(r["date"]),
                 "date": clean_date(r["date"]),
-                "merchant": r["merchant"].strip(),
+                "merchant": str(r["merchant"]).strip(),
+                "raw_amount": str(r["amount"]),
                 "amount": clean_amount(r["amount"]),
-                "currency": r["currency"].strip().upper(),
-                "status": r["status"].strip().upper(),
-                "category": r["category"].strip() or "Uncategorised",
-                "account_id": r["account_id"].strip(),
-                "notes": r.get("notes", "").strip() or None
+                "currency": str(r["currency"]).strip().upper(),
+                "status": str(r["status"]).strip().upper(),
+                "category": str(r["category"]).strip() or "Uncategorised",
+                "account_id": str(r["account_id"]).strip(),
+                "notes": str(r.get("notes", "")).strip() or None
             }
             cleaned_records.append(cleaned_rec)
         except CleaningError as e:

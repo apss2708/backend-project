@@ -1,40 +1,27 @@
 import statistics
 from decimal import Decimal
 from typing import List, Dict, Any, Set
-from sqlalchemy.orm import Session
-from app.models.transaction import Transaction
 
 DOMESTIC_ONLY_MERCHANTS: Set[str] = {"swiggy", "ola", "irctc"}
 
-def detect_anomalies(db: Session, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Step 1: Collect unique account IDs in the current batch
-    account_ids = {r["account_id"] for r in records}
-    
-    # Step 2: Query database for existing transaction amounts per account
-    historical_amounts: Dict[str, List[Decimal]] = {}
-    for acc_id in account_ids:
-        # Query existing completed transaction amounts for this account
-        results = db.query(Transaction.amount).filter(Transaction.account_id == acc_id).all()
-        historical_amounts[acc_id] = [Decimal(str(r[0])) for r in results]
-        
-    # Step 3: Combine with current batch to find the comprehensive median per account
-    account_all_amounts: Dict[str, List[Decimal]] = {}
+def detect_anomalies(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Step 1: Group amounts by account_id for the current job only
+    account_amounts: Dict[str, List[Decimal]] = {}
     for r in records:
         acc_id = r["account_id"]
-        if acc_id not in account_all_amounts:
-            # Seed with historical amounts
-            account_all_amounts[acc_id] = list(historical_amounts.get(acc_id, []))
-        account_all_amounts[acc_id].append(r["amount"])
+        if acc_id not in account_amounts:
+            account_amounts[acc_id] = []
+        account_amounts[acc_id].append(r["amount"])
         
-    # Calculate median per account
+    # Step 2: Compute median per account using current transactions
     medians: Dict[str, Decimal] = {}
-    for acc_id, amounts in account_all_amounts.items():
+    for acc_id, amounts in account_amounts.items():
         if amounts:
             medians[acc_id] = Decimal(str(statistics.median(amounts)))
         else:
             medians[acc_id] = Decimal("0")
             
-    # Step 4: Evaluate each record against anomaly rules
+    # Step 3: Evaluate each record against anomaly rules
     for r in records:
         acc_id = r["account_id"]
         amount = r["amount"]

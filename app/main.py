@@ -7,19 +7,10 @@ from app.core.database import Base, engine
 # Initialize log configuration
 setup_logging()
 
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Auto-create tables on startup (ensures reviewer setup works with zero manual migrations)
-    Base.metadata.create_all(bind=engine)
-    yield
-
 app = FastAPI(
     title="AI-Powered Transaction Processing Pipeline",
     description="Asynchronous processing of financial transactions using FastAPI, Celery, and PostgreSQL.",
-    version="1.0.0",
-    lifespan=lifespan
+    version="1.0.0"
 )
 
 app.add_middleware(

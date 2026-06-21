@@ -4,14 +4,16 @@ from decimal import Decimal
 from uuid import UUID
 
 class TransactionBase(BaseModel):
-    txnid: Optional[str] = None
-    date: str
-    merchant: str
-    amount: Decimal
-    currency: str
-    status: str
-    category: str
-    account_id: str
+    txn_id: Optional[str] = None
+    raw_date: Optional[str] = None
+    date: Optional[str] = None
+    merchant: Optional[str] = None
+    raw_amount: Optional[str] = None
+    amount: Optional[Decimal] = None
+    currency: Optional[str] = None
+    status: Optional[str] = None
+    category: Optional[str] = None
+    account_id: Optional[str] = None
     notes: Optional[str] = None
 
 class TransactionCreate(TransactionBase):

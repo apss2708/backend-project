@@ -1,6 +1,8 @@
 import os
 import uuid
 import logging
+import redis
+import json
 from typing import List, Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query
@@ -15,7 +17,7 @@ from app.models.summary import JobSummary
 from app.schemas.job import (
     JobUploadResponse,
     JobStatusResponse,
-    JobStatusSummary,
+    JobProgress,
     JobResultsResponse,
     JobListItem
 )
@@ -23,31 +25,30 @@ from app.schemas.transaction import TransactionResponse
 from app.schemas.summary import JobSummaryBase
 from app.core.config import settings
 
-# Celery task import inside worker to avoid circular dependency
+# Celery task import
 from app.tasks.worker import process_transaction_csv
 
 logger = logging.getLogger("app.api.routes.jobs")
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
+# Redis client for progress polling
+redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+
 @router.post("/upload", response_model=JobUploadResponse, status_code=202)
 async def upload_csv(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    # 1. Validate file extension
     if not file.filename.endswith(".csv"):
         raise HTTPException(
             status_code=400,
             detail="Invalid file format. Only CSV files are accepted."
         )
         
-    # Create upload directory if it doesn't exist
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     
-    # 2. Persist initial Job record
     job_id = uuid.uuid4()
     unique_filename = f"{job_id}_{file.filename}"
     file_path = os.path.join(settings.UPLOAD_DIR, unique_filename)
     
-    # Save file to host directory
     try:
         with open(file_path, "wb") as f:
             content = await file.read()
@@ -68,12 +69,20 @@ async def upload_csv(file: UploadFile = File(...), db: Session = Depends(get_db)
     db.commit()
     db.refresh(db_job)
     
-    # 3. Enqueue background task
+    # Initialize progress in Redis
+    try:
+        redis_client.set(
+            f"job:{job_id}:progress",
+            json.dumps({"stage": "pending", "completed": 0, "total": 0}),
+            ex=86400
+        )
+    except Exception as re_err:
+        logger.error(f"Redis initialization failed: {str(re_err)}")
+    
     try:
         process_transaction_csv.delay(str(job_id), file_path)
     except Exception as e:
         logger.error(f"Failed to queue celery task for job {job_id}: {str(e)}")
-        # Fail the job record immediately in DB
         db_job.status = "failed"
         db_job.error_message = f"Queue worker trigger failed: {str(e)}"
         db.commit()
@@ -84,8 +93,7 @@ async def upload_csv(file: UploadFile = File(...), db: Session = Depends(get_db)
         
     return JobUploadResponse(
         job_id=db_job.id,
-        status=db_job.status,
-        message="Job created and queued for processing"
+        status=db_job.status
     )
 
 @router.get("/{job_id}/status", response_model=JobStatusResponse)
@@ -94,25 +102,46 @@ def get_job_status(job_id: UUID, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
         
-    # Check if there is an associated JobSummary
-    summary_data = None
-    if job.status == "completed":
-        summary = db.query(JobSummary).filter(JobSummary.job_id == job_id).first()
-        if summary:
-            summary_data = JobStatusSummary(
-                total_spend_inr=summary.total_spend_inr,
-                total_spend_usd=summary.total_spend_usd,
-                anomaly_count=summary.anomaly_count,
-                risk_level=summary.risk_level
-            )
+    # Poll progress from Redis
+    progress_stage = "pending"
+    progress_completed = 0
+    progress_total = 0
+    
+    try:
+        progress_data = redis_client.get(f"job:{job_id}:progress")
+        if progress_data:
+            p_dict = json.loads(progress_data)
+            progress_stage = p_dict.get("stage", "pending")
+            progress_completed = int(p_dict.get("completed", 0))
+            progress_total = int(p_dict.get("total", 0))
+        else:
+            # Fallback static states if Redis has expired
+            if job.status == "completed":
+                progress_stage = "completed"
+                progress_completed = job.row_count_clean or 0
+                progress_total = job.row_count_clean or 0
+            elif job.status == "failed":
+                progress_stage = "failed"
+            elif job.status == "processing":
+                progress_stage = "processing"
+    except Exception as re_err:
+        logger.error(f"Failed to fetch progress from Redis: {str(re_err)}")
+        if job.status == "completed":
+            progress_stage = "completed"
+            progress_completed = job.row_count_clean or 0
+            progress_total = job.row_count_clean or 0
             
     return JobStatusResponse(
-        job_id=job.id,
         status=job.status,
         filename=job.filename,
         created_at=job.created_at,
+        processing_started_at=job.processing_started_at,
         completed_at=job.completed_at,
-        summary=summary_data,
+        progress=JobProgress(
+            stage=progress_stage,
+            completed=progress_completed,
+            total=progress_total
+        ),
         error_message=job.error_message
     )
 
@@ -122,32 +151,27 @@ def get_job_results(job_id: UUID, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
         
-    # Results are only fully computed for completed jobs
     if job.status != "completed":
         raise HTTPException(
             status_code=400,
             detail=f"Job is in state '{job.status}'. Results are only available for 'completed' jobs."
         )
         
-    # Fetch transactions
     transactions = db.query(Transaction).filter(Transaction.job_id == job_id).all()
     anomalies = [t for t in transactions if t.is_anomaly]
     
-    # Calculate category spend breakdown
+    # Calculate aggregates
     category_breakdown = {}
     currency_totals = {"INR": Decimal("0.00"), "USD": Decimal("0.00")}
-    llm_failed_rows_count = 0
     
     for t in transactions:
+        # Sum category amounts
         category_breakdown[t.category] = category_breakdown.get(t.category, Decimal("0.00")) + t.amount
         
-        # Calculate totals per currency (INR, USD, etc.)
+        # Sum totals per currency
         currency_totals[t.currency] = currency_totals.get(t.currency, Decimal("0.00")) + t.amount
         
-        if t.llm_failed:
-            llm_failed_rows_count += 1
-            
-    # Fetch JobSummary record
+    # Fetch job summary
     summary_record = db.query(JobSummary).filter(JobSummary.job_id == job_id).first()
     summary_response = None
     if summary_record:
@@ -160,19 +184,15 @@ def get_job_results(job_id: UUID, db: Session = Depends(get_db)):
             risk_level=summary_record.risk_level
         )
         
-    # Serialize lists using Pydantic conversion
     txn_responses = [TransactionResponse.model_validate(t) for t in transactions]
     anomaly_responses = [TransactionResponse.model_validate(a) for a in anomalies]
     
     return JobResultsResponse(
-        job_id=job.id,
-        status=job.status,
         cleaned_transactions=txn_responses,
         anomalies=anomaly_responses,
         category_breakdown=category_breakdown,
         currency_totals=currency_totals,
-        summary=summary_response,
-        llm_failed_rows_count=llm_failed_rows_count
+        summary=summary_response
     )
 
 @router.get("", response_model=List[JobListItem])
@@ -193,7 +213,10 @@ def list_jobs(
             status=job.status,
             row_count_raw=job.row_count_raw,
             row_count_clean=job.row_count_clean,
-            created_at=job.created_at
+            llm_failed_batches=job.llm_failed_batches,
+            created_at=job.created_at,
+            processing_started_at=job.processing_started_at,
+            completed_at=job.completed_at
         )
         for job in jobs
     ]

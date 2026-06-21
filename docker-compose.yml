@@ -31,6 +31,18 @@ services:
       timeout: 5s
       retries: 5
 
+  migration:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    container_name: pipeline_migration
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/transactions_db
+    depends_on:
+      db:
+        condition: service_healthy
+    command: alembic upgrade head
+
   api:
     build:
       context: .
@@ -52,6 +64,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migration:
+        condition: service_completed_successfully
     volumes:
       - uploads_data:/workspace/uploads
 
@@ -74,6 +88,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migration:
+        condition: service_completed_successfully
     volumes:
       - uploads_data:/workspace/uploads
 

@@ -1,8 +1,5 @@
 import pytest
 from decimal import Decimal
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from app.core.database import Base
 from app.services.cleaner import clean_amount, clean_date, clean_records, CleaningError
 from app.services.anomaly_detector import detect_anomalies
 from app.services.llm_service import extract_json
@@ -11,6 +8,7 @@ def test_clean_amount():
     assert clean_amount("$10882.55") == Decimal("10882.55")
     assert clean_amount("10882.55") == Decimal("10882.55")
     assert clean_amount("Rs. 5,000.00") == Decimal("5000.00")
+    assert clean_amount("INR 5,000.00") == Decimal("5000.00")
     assert clean_amount("-123.45") == Decimal("-123.45")
     with pytest.raises(CleaningError):
         clean_amount("no digits")
@@ -53,41 +51,30 @@ def test_clean_records_deduplication():
     assert len(cleaned) == 1
     assert cleaned[0]["category"] == "Uncategorised"
     assert cleaned[0]["status"] == "FAILED"
+    assert cleaned[0]["raw_amount"] == "423.91"
+    assert cleaned[0]["raw_date"] == "23-11-2024"
 
-def test_detect_anomalies():
-    # Setup in-memory sqlite db for tests
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(bind=engine)
-    TestingSessionLocal = sessionmaker(bind=engine)
-    db = TestingSessionLocal()
+def test_detect_anomalies_only_current_job():
+    records = [
+        {"account_id": "ACC001", "amount": Decimal("100.00"), "currency": "INR", "merchant": "Jio Recharge", "is_anomaly": False, "anomaly_reason": None},
+        {"account_id": "ACC001", "amount": Decimal("150.00"), "currency": "INR", "merchant": "Jio Recharge", "is_anomaly": False, "anomaly_reason": None},
+        {"account_id": "ACC001", "amount": Decimal("120.00"), "currency": "INR", "merchant": "Jio Recharge", "is_anomaly": False, "anomaly_reason": None},
+        # Exceeds 3x median (median is 120.00, 3x is 360.00, so 500 should be anomalous)
+        {"account_id": "ACC001", "amount": Decimal("500.00"), "currency": "INR", "merchant": "Jio Recharge", "is_anomaly": False, "anomaly_reason": None},
+        # Domestic merchant USD check
+        {"account_id": "ACC002", "amount": Decimal("50.00"), "currency": "USD", "merchant": "Swiggy", "is_anomaly": False, "anomaly_reason": None},
+        {"account_id": "ACC002", "amount": Decimal("50.00"), "currency": "INR", "merchant": "Swiggy", "is_anomaly": False, "anomaly_reason": None}
+    ]
     
-    try:
-        records = [
-            {"account_id": "ACC001", "amount": Decimal("100.00"), "currency": "INR", "merchant": "Jio Recharge", "is_anomaly": False, "anomaly_reason": None},
-            {"account_id": "ACC001", "amount": Decimal("150.00"), "currency": "INR", "merchant": "Jio Recharge", "is_anomaly": False, "anomaly_reason": None},
-            {"account_id": "ACC001", "amount": Decimal("120.00"), "currency": "INR", "merchant": "Jio Recharge", "is_anomaly": False, "anomaly_reason": None},
-            # 3x median check: median is ~120, so 3x is 360. 500 should be anomaly
-            {"account_id": "ACC001", "amount": Decimal("500.00"), "currency": "INR", "merchant": "Jio Recharge", "is_anomaly": False, "anomaly_reason": None},
-            # Domestic merchant USD check
-            {"account_id": "ACC002", "amount": Decimal("50.00"), "currency": "USD", "merchant": "Swiggy", "is_anomaly": False, "anomaly_reason": None},
-            {"account_id": "ACC002", "amount": Decimal("50.00"), "currency": "INR", "merchant": "Swiggy", "is_anomaly": False, "anomaly_reason": None}
-        ]
-        
-        results = detect_anomalies(db, records)
-        
-        # Check median rule
-        # ACC001 amounts: [100, 150, 120, 500], median is 135.00
-        # 3 * 135 = 405. 500 > 405, so it is an anomaly
-        assert results[0]["is_anomaly"] is False
-        assert results[3]["is_anomaly"] is True
-        assert "exceeds 3x median" in results[3]["anomaly_reason"]
-        
-        # Check USD rule
-        assert results[4]["is_anomaly"] is True
-        assert "Swiggy" in results[4]["anomaly_reason"]
-        assert results[5]["is_anomaly"] is False
-    finally:
-        db.close()
+    results = detect_anomalies(records)
+    
+    assert results[0]["is_anomaly"] is False
+    assert results[3]["is_anomaly"] is True
+    assert "exceeds 3x median" in results[3]["anomaly_reason"]
+    
+    assert results[4]["is_anomaly"] is True
+    assert "Swiggy" in results[4]["anomaly_reason"]
+    assert results[5]["is_anomaly"] is False
 
 def test_extract_json():
     text = "Here is the response: ```json [1, 2, 3] ``` Hope this helps!"

@@ -2,13 +2,12 @@ import time
 import json
 import logging
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Tuple, Optional
 from decimal import Decimal
 from app.core.config import settings
 
 logger = logging.getLogger("app.services.llm")
 
-# Check if LLM SDKs can be imported
 try:
     import google.generativeai as genai
     HAS_GEMINI_SDK = True
@@ -24,13 +23,12 @@ except ImportError:
 ALLOWED_CATEGORIES = {"Food", "Shopping", "Travel", "Transport", "Utilities", "Cash Withdrawal", "Entertainment", "Other"}
 
 def extract_json(text: str) -> str:
-    # Find first block of JSON array or object
     match = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
     if match:
         return match.group(0)
     return text
 
-def call_llm(prompt: str, json_response: bool = True) -> str:
+def call_llm(prompt: str, json_response: bool = True, gemini_fallback: bool = False) -> str:
     provider = settings.LLM_PROVIDER.lower()
     api_key = settings.LLM_API_KEY
     
@@ -43,11 +41,23 @@ def call_llm(prompt: str, json_response: bool = True) -> str:
             raise ValueError("google-generativeai SDK is not installed")
         
         genai.configure(api_key=api_key)
-        model_name = settings.LLM_MODEL or "gemini-1.5-flash"
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(prompt)
-        return response.text
         
+        # Determine model to use
+        model_name = settings.LLM_MODEL
+        if not model_name:
+            model_name = "gemini-1.5-flash" if gemini_fallback else "gemini-2.5-flash"
+            
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            # If default gemini-2.5-flash failed, fall back to gemini-1.5-flash
+            if not gemini_fallback and not settings.LLM_MODEL:
+                logger.warning(f"Gemini call to gemini-2.5-flash failed: {str(e)}. Retrying with fallback model gemini-1.5-flash.")
+                return call_llm(prompt, json_response=json_response, gemini_fallback=True)
+            raise e
+            
     elif provider == "openai":
         if not HAS_OPENAI_SDK:
             raise ValueError("openai SDK is not installed")
@@ -65,17 +75,16 @@ def call_llm(prompt: str, json_response: bool = True) -> str:
     else:
         raise ValueError(f"Unsupported LLM provider: {provider}")
 
-def classify_categories_batch(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Batch is a list of dicts with keys: temp_index, merchant, amount, currency, notes
+def classify_categories_batch(batch: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], bool]:
+    # Returns (processed_batch, was_successful)
     if not settings.LLM_API_KEY:
         # Fallback category assignment
         for item in batch:
             item["llm_category"] = "Other"
             item["llm_raw_response"] = "Fallback: LLM API key not configured"
             item["llm_failed"] = True
-        return batch
+        return batch, False
         
-    # Format transactions for prompt
     tx_list = []
     for item in batch:
         tx_list.append({
@@ -99,20 +108,18 @@ Return ONLY a valid JSON array of objects, containing:
 ]
 Do not include any explanation or markdown formatting other than the JSON block."""
 
-    # Retry loop with exponential backoff
+    # Retry loop: max 3 retries, exponential backoff
     for attempt in range(1, 4):
         try:
             raw_response = call_llm(prompt, json_response=True)
             cleaned_json = extract_json(raw_response)
             classifications = json.loads(cleaned_json)
             
-            # Map classifications back to batch
             class_map = {item["index"]: item["category"] for item in classifications if "index" in item}
             
             for item in batch:
                 idx = item["temp_index"]
                 cat = class_map.get(idx, "Other")
-                # Normalize capitalization
                 normalized_cat = cat.strip().title() if cat else "Other"
                 if normalized_cat not in ALLOWED_CATEGORIES:
                     normalized_cat = "Other"
@@ -120,29 +127,47 @@ Do not include any explanation or markdown formatting other than the JSON block.
                 item["llm_raw_response"] = raw_response
                 item["llm_failed"] = False
                 
-            return batch
+            return batch, True
         except Exception as e:
             logger.error(f"LLM Classification batch attempt {attempt} failed: {str(e)}")
             if attempt < 3:
                 time.sleep(2 ** attempt)
             else:
-                # All attempts failed, mark all as failed
+                # All 3 retries failed -> mark as failed
                 for item in batch:
                     item["llm_category"] = "Other"
-                    item["llm_raw_response"] = f"Error after 3 attempts: {str(e)}"
+                    item["llm_raw_response"] = f"Error after 3 retries: {str(e)}"
                     item["llm_failed"] = True
-                return batch
+                return batch, False
+
+def validate_summary_json(data: Dict[str, Any]) -> bool:
+    required_keys = {"total_spend_inr", "total_spend_usd", "top_merchants", "anomaly_count", "narrative", "risk_level"}
+    if not required_keys.issubset(data.keys()):
+        return False
+    if not isinstance(data["top_merchants"], list):
+        return False
+    if data["risk_level"] not in {"low", "medium", "high"}:
+        return False
+    try:
+        float(data["total_spend_inr"])
+        float(data["total_spend_usd"])
+        int(data["anomaly_count"])
+    except (ValueError, TypeError):
+        return False
+    return True
 
 def generate_narrative_summary(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    fallback_result = {
+        "total_spend_inr": metrics["total_spend_inr"],
+        "total_spend_usd": metrics["total_spend_usd"],
+        "top_merchants": metrics["top_merchants"],
+        "anomaly_count": metrics["anomaly_count"],
+        "narrative": "LLM narrative summary fallback. Transactions processed successfully.",
+        "risk_level": "medium" if metrics["anomaly_count"] > 0 else "low"
+    }
+
     if not settings.LLM_API_KEY:
-        return {
-            "total_spend_inr": metrics["total_spend_inr"],
-            "total_spend_usd": metrics["total_spend_usd"],
-            "top_merchants": metrics["top_merchants"],
-            "anomaly_count": metrics["anomaly_count"],
-            "narrative": "LLM narrative summary fallback. Transactions processed and cleaned successfully.",
-            "risk_level": "low"
-        }
+        return fallback_result
         
     prompt = f"""You are a financial analyst. Analyze this summary of a transaction processing job and generate a narrative summary and risk assessment.
 
@@ -173,30 +198,21 @@ Do not include any explanation or markdown formatting other than the JSON block.
             cleaned_json = extract_json(raw_response)
             data = json.loads(cleaned_json)
             
-            # Ensure risk level is valid
-            risk = str(data.get("risk_level", "low")).lower()
-            if risk not in {"low", "medium", "high"}:
-                risk = "low"
+            # Strict validation
+            if not validate_summary_json(data):
+                raise ValueError("JSON response failed strict key/type validation check")
                 
             return {
-                "total_spend_inr": Decimal(str(data.get("total_spend_inr", metrics["total_spend_inr"]))),
-                "total_spend_usd": Decimal(str(data.get("total_spend_usd", metrics["total_spend_usd"]))),
-                "top_merchants": data.get("top_merchants", metrics["top_merchants"]),
-                "anomaly_count": int(data.get("anomaly_count", metrics["anomaly_count"])),
-                "narrative": data.get("narrative", "Processed successfully."),
-                "risk_level": risk
+                "total_spend_inr": Decimal(str(data["total_spend_inr"])),
+                "total_spend_usd": Decimal(str(data["total_spend_usd"])),
+                "top_merchants": data["top_merchants"],
+                "anomaly_count": int(data["anomaly_count"]),
+                "narrative": str(data["narrative"]),
+                "risk_level": str(data["risk_level"])
             }
         except Exception as e:
             logger.error(f"LLM Narrative Summary attempt {attempt} failed: {str(e)}")
             if attempt < 3:
                 time.sleep(2 ** attempt)
             else:
-                # Return fallback summary values
-                return {
-                    "total_spend_inr": metrics["total_spend_inr"],
-                    "total_spend_usd": metrics["total_spend_usd"],
-                    "top_merchants": metrics["top_merchants"],
-                    "anomaly_count": metrics["anomaly_count"],
-                    "narrative": f"Fallback: Narrative generation failed. Reason: {str(e)}",
-                    "risk_level": "medium" if metrics["anomaly_count"] > 0 else "low"
-                }
+                return fallback_result

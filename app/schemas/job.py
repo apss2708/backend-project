@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List, Dict, Optional
 from datetime import datetime
 from decimal import Decimal
@@ -9,26 +9,22 @@ from app.schemas.summary import JobSummaryBase
 class JobUploadResponse(BaseModel):
     job_id: UUID
     status: str
-    message: str
 
-class JobStatusSummary(BaseModel):
-    total_spend_inr: Decimal
-    total_spend_usd: Decimal
-    anomaly_count: int
-    risk_level: str
+class JobProgress(BaseModel):
+    stage: str
+    completed: int
+    total: int
 
 class JobStatusResponse(BaseModel):
-    job_id: UUID
     status: str
     filename: str
     created_at: datetime
+    processing_started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
-    summary: Optional[JobStatusSummary] = None
+    progress: JobProgress
     error_message: Optional[str] = None
 
 class JobResultsResponse(BaseModel):
-    job_id: UUID
-    status: str
     cleaned_transactions: List[TransactionResponse]
     anomalies: List[TransactionResponse]
     category_breakdown: Dict[str, Decimal]
@@ -41,4 +37,7 @@ class JobListItem(BaseModel):
     status: str
     row_count_raw: Optional[int] = None
     row_count_clean: Optional[int] = None
+    llm_failed_batches: int = 0
     created_at: datetime
+    processing_started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None

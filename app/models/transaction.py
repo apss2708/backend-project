@@ -8,14 +8,16 @@ class Transaction(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
-    txnid = Column(String(100), nullable=True)  # txn_id in CSV can be empty/null
-    date = Column(String(50), nullable=False)  # Normalized to ISO 8601 (YYYY-MM-DD)
-    merchant = Column(String(255), nullable=False)
-    amount = Column(Numeric(12, 2), nullable=False)
-    currency = Column(String(10), nullable=False)
-    status = Column(String(50), nullable=False)  # Normalized status values (uppercase)
-    category = Column(String(100), nullable=False)  # Normalized category values
-    account_id = Column(String(100), nullable=False)
+    txn_id = Column(String(100), nullable=True)  # txn_id in CSV can be empty/null
+    raw_date = Column(String(100), nullable=True)
+    date = Column(String(50), nullable=True)  # Normalized to ISO 8601 (YYYY-MM-DD)
+    merchant = Column(String(255), nullable=True)
+    raw_amount = Column(String(100), nullable=True)
+    amount = Column(Numeric(18, 2), nullable=True)  # Decimal-safe amount (Numeric(18,2))
+    currency = Column(String(10), nullable=True)
+    status = Column(String(50), nullable=True)
+    category = Column(String(100), nullable=True)
+    account_id = Column(String(100), nullable=True, index=True)  # account_id is indexed
     notes = Column(Text, nullable=True)
     
     # Anomaly fields
