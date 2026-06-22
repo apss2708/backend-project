@@ -32,32 +32,63 @@ logger = logging.getLogger("app.api.routes.jobs")
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
+# Maximum allowed upload size: 10 MB
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB in bytes
+
+# Accepted MIME types for CSV uploads
+ALLOWED_MIME_TYPES = {"text/csv", "application/vnd.ms-excel"}
+
 # Redis client for progress polling
 redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
 @router.post("/upload", response_model=JobUploadResponse, status_code=202)
 async def upload_csv(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    if not file.filename.endswith(".csv"):
+    # --- MIME type validation ---
+    # Accept only text/csv or application/vnd.ms-excel (Excel-saved CSVs).
+    # Browsers and tools may send either; both are legitimate CSV content types.
+    if file.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Unsupported media type '{file.content_type}'. "
+                "Only text/csv and application/vnd.ms-excel are accepted."
+            ),
+        )
+
+    # --- File extension check (belt-and-suspenders) ---
+    if not (file.filename or "").lower().endswith(".csv"):
         raise HTTPException(
             status_code=400,
-            detail="Invalid file format. Only CSV files are accepted."
+            detail="Invalid file format. Only .csv files are accepted.",
         )
-        
+
+    # --- File size validation ---
+    # Read the entire content once; reject if it exceeds MAX_UPLOAD_SIZE (10 MB).
+    # We read upfront so we can validate size before touching the filesystem.
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File too large ({len(content) / (1024 * 1024):.2f} MB). "
+                f"Maximum allowed size is {MAX_UPLOAD_SIZE // (1024 * 1024)} MB."
+            ),
+        )
+
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    
+
     job_id = uuid.uuid4()
     unique_filename = f"{job_id}_{file.filename}"
     file_path = os.path.join(settings.UPLOAD_DIR, unique_filename)
-    
+
     try:
         with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+            f.write(content)  # content already read above
     except Exception as e:
         logger.error(f"Failed to save uploaded file: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to save upload file: {str(e)}"
+            detail=f"Failed to save upload file: {str(e)}",
         )
         
     db_job = Job(

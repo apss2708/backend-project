@@ -1,30 +1,30 @@
 # AI-Powered Transaction Processing Pipeline
 
-An asynchronous production-grade backend processing pipeline for dirty financial transactions. The system ingests CSV uploads via Pandas, cleans and normalizes dates and amounts, detects transaction anomalies, enriches categories in batches using LLMs (Gemini/OpenAI), and generates narrative summaries.
+An asynchronous, production-grade backend pipeline for dirty financial transaction data. Upload a CSV → background worker cleans, validates, detects anomalies, enriches categories via LLM, and returns a structured narrative summary.
 
 ---
 
 ## Architecture Diagram
 
-```mermaid
-flowchart TD
-    Client[Client / Reviewer] -->|POST /jobs/upload| API[FastAPI Web Container]
-    Client -->|GET /jobs/:job_id/status| API
-    Client -->|GET /jobs/:job_id/results| API
-    
-    API -->|1. Create pending Job| PG[(PostgreSQL Database)]
-    API -->|2. Trigger Celery Task| Redis[(Redis Broker)]
-    
-    Redis -->|3. Consume Task| Worker[Celery Worker Container]
-    
-    Worker -->|Stage A: Ingestion| Parser[Pandas parser]
-    Worker -->|Stage B: Normalization| Cleaner[Cleaner service]
-    Worker -->|Stage C: Anomaly Rules| Detector[Anomaly detector]
-    Worker -->|Stage D: Batch Category Enrichment| LLM[LLM Service: Gemini / OpenAI]
-    Worker -->|Stage E: Narrative Summary| LLM
-    
-    Worker -->|Update dynamic stage progress| Redis
-    Worker -->|Stage F: Persist clean data & summaries| PG
+![Architecture Diagram](architecture.png)
+
+**Flow:**
+
+```
+Client
+  ↓  POST /jobs/upload | GET /jobs/:id/status | GET /jobs/:id/results
+FastAPI API
+  ↓ (1) Create Job (pending)          ↓ (2) Enqueue Task
+PostgreSQL                          Redis Broker
+                                        ↓ (3) Consume Task
+                                    Celery Worker
+                                      ├─ Stage A: CSV Ingestion (Pandas)
+                                      ├─ Stage B: Data Cleaning
+                                      ├─ Stage C: Anomaly Detection
+                                      ├─ Stage D: LLM Category Classification → LLM Provider
+                                      └─ Stage E: Narrative Summary            (Gemini / OpenAI)
+                                        ↓ (5) Persist results    ↑ (6) Update progress
+                                    PostgreSQL                  Redis
 ```
 
 ---
@@ -33,84 +33,160 @@ flowchart TD
 
 ```text
 app/
-  api/
-    routes/
-      jobs.py         # Upload, listing, results, and Redis progress polling
+  api/routes/jobs.py         # Upload, status polling, results, job list
   core/
-    config.py         # Pydantic configuration settings
-    database.py       # SQLAlchemy engine & session helper
-    celery.py         # Celery configuration settings (acks_late=True, prefetch=1)
-    logging.py        # Logging structure
+    config.py                # Pydantic-settings configuration
+    database.py              # SQLAlchemy engine & session
+    celery.py                # Celery app (acks_late=True, prefetch=1)
+    logging.py               # Structured JSON logging setup
   models/
-    job.py            # Job schema
-    transaction.py    # Transaction schema (raw dates/amounts, anomalies)
-    summary.py        # JobSummary schema (spend totals, narratives)
+    job.py                   # Job ORM model
+    transaction.py           # Transaction ORM model (raw + cleaned fields)
+    summary.py               # JobSummary ORM model
   schemas/
-    job.py            # Job Pydantic validation schemas
-    transaction.py    # Transaction validation schemas
-    summary.py        # JobSummary validation schemas
+    job.py                   # Job Pydantic schemas
+    transaction.py           # Transaction Pydantic schemas
+    summary.py               # JobSummary Pydantic schemas
   services/
-    csv_parser.py     # Stage A: Pandas parser
-    cleaner.py        # Stage B: Deduplication & amount/date cleaner
-    anomaly_detector.py # Stage C: Median rules (job-scoped only)
-    llm_service.py    # Stage D & E: Category categorizer & narrative generator
-    summary_builder.py# Aggregations compiler
-  tasks/
-    worker.py         # Celery task pipeline orchestrator
-  main.py             # FastAPI entrypoint
-migrations/           # Alembic migrations history
+    csv_parser.py            # Stage A – Pandas CSV ingestion & header validation
+    cleaner.py               # Stage B – Deduplication, date/amount normalization
+    anomaly_detector.py      # Stage C – Job-scoped median anomaly rules
+    llm_service.py           # Stage D & E – Batched LLM classification & narrative
+    summary_builder.py       # Metric aggregator (spend totals, top merchants)
+  tasks/worker.py            # Celery pipeline orchestrator (A → F)
+  main.py                    # FastAPI application entrypoint
+migrations/                  # Alembic migration history (DO NOT use create_all)
 docker/
-  api.Dockerfile      # Web container Dockerfile
-  worker.Dockerfile   # Celery worker Dockerfile
-tests/                # Unit and integration test suite
-docker-compose.yml    # Database, Redis, Migrations, API, and Worker config
-.env.example          # Environment template
-requirements.txt      # Dependency catalog
+  api.Dockerfile             # API container image
+  worker.Dockerfile          # Celery worker container image
+tests/
+  test_unit.py               # Unit tests for services
+  test_integration.py        # Integration tests (SQLite + mocked Celery)
+docker-compose.yml           # Full stack: db, redis, migration, api, worker
+.env.example                 # Environment variable template
+transactions.csv             # Sample dirty transaction dataset (96 rows)
+requirements.txt             # Python dependencies
 ```
 
 ---
 
-## Getting Started
+## Setup
 
-### 1. Environment Setup
-Create a `.env` file in the root directory and specify your parameters (see `.env.example`):
+### 1. Configure environment variables
+
+Copy the example env file and fill in your LLM API key:
+
+```bash
+cp .env.example .env
+```
+
+`.env` values:
 
 ```bash
 DATABASE_URL=postgresql://postgres:postgres@db:5432/transactions_db
 REDIS_URL=redis://redis:6379/0
-LLM_PROVIDER=gemini
-LLM_API_KEY=your_gemini_api_key
+LLM_PROVIDER=gemini          # or: openai
+LLM_API_KEY=your_api_key_here
+LLM_MODEL=gemini-2.5-flash   # or: gpt-4o-mini
 UPLOAD_DIR=/workspace/uploads
 LOG_LEVEL=INFO
 ```
 
-### 2. Run the Stack
-Start all services in detached mode with Docker Compose. This automatically runs Alembic migrations, creates all tables, and starts both the FastAPI server and Celery background workers:
+### 2. Start the full stack
 
 ```bash
 docker compose up --build
 ```
 
-- API Server: [http://localhost:8000](http://localhost:8000)
-- Interactive Documentation: [http://localhost:8000/docs](http://localhost:8000/docs)
+This single command:
+- Starts PostgreSQL and Redis (with health checks)
+- **Runs Alembic migrations automatically** via a dedicated `migration` container
+- Starts the FastAPI API server on port `8000`
+- Starts the Celery background worker
+
+> **Note:** The `api` and `worker` containers depend on `migration` completing successfully (`service_completed_successfully`). You never need to run migrations manually.
+
+- API server: [http://localhost:8000](http://localhost:8000)
+- Interactive Swagger docs: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ---
 
-## API Contracts
+## Run Migrations
 
-### 1. Upload CSV File
-- **Endpoint**: `POST /jobs/upload`
-- **Payload**: `multipart/form-data` with key `file` containing the CSV file.
+Migrations run **automatically** on every `docker compose up` via the `migration` service:
 
-**curl example:**
+```yaml
+# docker-compose.yml (excerpt)
+migration:
+  command: alembic upgrade head
+  depends_on:
+    db:
+      condition: service_healthy
+```
+
+To run migrations manually (e.g., during development):
+
+```bash
+docker compose run --rm migration alembic upgrade head
+```
+
+To create a new migration after model changes:
+
+```bash
+docker compose run --rm migration alembic revision --autogenerate -m "describe_change"
+```
+
+---
+
+## Test
+
+Run the full test suite (unit + integration) inside the running API container:
+
+```bash
+docker compose exec api pytest
+```
+
+Or with verbose output:
+
+```bash
+docker compose exec api pytest -v
+```
+
+Tests use an **in-memory SQLite database** and **mocked Celery tasks** — no external services required. The suite covers:
+
+- `test_unit.py` — CSV parser, cleaner, anomaly detector, summary builder
+- `test_integration.py` — Full upload → status → results lifecycle
+
+---
+
+## API Docs
+
+FastAPI automatically generates interactive API documentation:
+
+| Interface | URL |
+|-----------|-----|
+| **Swagger UI** | [http://localhost:8000/docs](http://localhost:8000/docs) |
+| **ReDoc** | [http://localhost:8000/redoc](http://localhost:8000/redoc) |
+| **OpenAPI JSON** | [http://localhost:8000/openapi.json](http://localhost:8000/openapi.json) |
+
+---
+
+## API Reference
+
+### POST `/jobs/upload` — Upload CSV
+
 ```bash
 curl -X POST "http://localhost:8000/jobs/upload" \
-  -H "accept: application/json" \
   -H "Content-Type: multipart/form-data" \
   -F "file=@transactions.csv"
 ```
 
-**Response:**
+**Validation rules:**
+- Content-Type must be `text/csv` or `application/vnd.ms-excel` (HTTP 415 otherwise)
+- File extension must be `.csv` (HTTP 400 otherwise)
+- File size must be ≤ 10 MB (HTTP 413 otherwise)
+
+**Response `202`:**
 ```json
 {
   "job_id": "0b3aa954-1d94-420d-94f6-ef523292330b",
@@ -120,42 +196,40 @@ curl -X POST "http://localhost:8000/jobs/upload" \
 
 ---
 
-### 2. Poll Job Status
-- **Endpoint**: `GET /jobs/{job_id}/status`
+### GET `/jobs/{job_id}/status` — Poll Status
 
-**curl example:**
 ```bash
-curl -X GET "http://localhost:8000/jobs/0b3aa954-1d94-420d-94f6-ef523292330b/status"
+curl "http://localhost:8000/jobs/0b3aa954-1d94-420d-94f6-ef523292330b/status"
 ```
 
-**Response (completed):**
+**Response `200`:**
 ```json
 {
-  "status": "completed",
+  "status": "processing",
   "filename": "transactions.csv",
   "created_at": "2026-06-21T22:12:14.453Z",
   "processing_started_at": "2026-06-21T22:12:14.456Z",
-  "completed_at": "2026-06-21T22:12:16.890Z",
+  "completed_at": null,
   "progress": {
-    "stage": "completed",
-    "completed": 4,
-    "total": 4
+    "stage": "LLM Classification",
+    "completed": 15,
+    "total": 30
   },
   "error_message": null
 }
 ```
 
+`status` values: `pending` → `processing` → `completed` | `failed`
+
 ---
 
-### 3. Retrieve Job Results
-- **Endpoint**: `GET /jobs/{job_id}/results`
+### GET `/jobs/{job_id}/results` — Retrieve Results
 
-**curl example:**
 ```bash
-curl -X GET "http://localhost:8000/jobs/0b3aa954-1d94-420d-94f6-ef523292330b/results"
+curl "http://localhost:8000/jobs/0b3aa954-1d94-420d-94f6-ef523292330b/results"
 ```
 
-**Response:**
+**Response `200`:**
 ```json
 {
   "cleaned_transactions": [
@@ -181,19 +255,14 @@ curl -X GET "http://localhost:8000/jobs/0b3aa954-1d94-420d-94f6-ef523292330b/res
     }
   ],
   "anomalies": [],
-  "category_breakdown": {
-    "Shopping": 10882.55
-  },
-  "currency_totals": {
-    "INR": 10882.55,
-    "USD": 0.00
-  },
+  "category_breakdown": { "Shopping": 10882.55 },
+  "currency_totals": { "INR": 10882.55, "USD": 0.00 },
   "summary": {
     "total_spend_inr": 10882.55,
     "total_spend_usd": 0.00,
     "top_merchants": ["Flipkart"],
     "anomaly_count": 0,
-    "narrative": "Spending patterns reveal highly contained shopping expenses with zero anomalies detected. Account stands in a solid and low risk condition.",
+    "narrative": "Spending patterns reveal contained shopping expenses with zero anomalies detected.",
     "risk_level": "low"
   }
 }
@@ -201,23 +270,21 @@ curl -X GET "http://localhost:8000/jobs/0b3aa954-1d94-420d-94f6-ef523292330b/res
 
 ---
 
-### 4. List All Jobs
-- **Endpoint**: `GET /jobs`
-- **Query Params**: `status` (optional status filter, e.g., `/jobs?status=completed`)
+### GET `/jobs` — List All Jobs
 
-**curl example:**
 ```bash
-curl -X GET "http://localhost:8000/jobs"
+curl "http://localhost:8000/jobs"
+curl "http://localhost:8000/jobs?status=completed"
 ```
 
-**Response:**
+**Response `200`:**
 ```json
 [
   {
     "job_id": "0b3aa954-1d94-420d-94f6-ef523292330b",
     "filename": "transactions.csv",
     "status": "completed",
-    "row_count_raw": 92,
+    "row_count_raw": 96,
     "row_count_clean": 88,
     "llm_failed_batches": 0,
     "created_at": "2026-06-21T22:12:14.453Z",
@@ -229,37 +296,41 @@ curl -X GET "http://localhost:8000/jobs"
 
 ---
 
-## Local Development & Testing
+## Pipeline Stages
 
-You can spin up local test runs using virtual environment configs:
-
-```bash
-# 1. Setup virtual env
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 2. Install requirements
-pip install -r requirements.txt
-
-# 3. Execute unit and integration tests (uses in-memory SQLite + mocked task workers)
-PYTHONPATH=. pytest tests/
-```
+| Stage | Service | Description |
+|-------|---------|-------------|
+| A | `csv_parser.py` | Pandas CSV ingestion; validates headers and rejects malformed files |
+| B | `cleaner.py` | Deduplication by `txn_id`; normalizes dates (7 formats), strips currency symbols, uppercases status |
+| C | `anomaly_detector.py` | Job-scoped median rules: flags amounts > 3× median and invalid dates |
+| D | `llm_service.py` | Batched LLM category enrichment (batch size 15) with retry + fallback to `"Other"` |
+| E | `llm_service.py` | Narrative summary generation with `risk_level` classification |
+| F | `worker.py` | Persists all cleaned `Transaction` records and `JobSummary` to PostgreSQL |
 
 ---
 
-## Production Scalability Bottlenecks
+## Key Design Decisions
 
-1. **Celery Worker Thread Saturation**: Synchronous Python code processing large CSVs blocks workers.
-   - *Mitigation*: Run Celery workers with concurrency configurations (`--concurrency=X`) and configure a dedicated rate limiter for external LLM client requests.
-2. **PostgreSQL Database Connection Pools**: Spawning hundreds of threads/tasks concurrently can overwhelm the database engine connection limits.
-   - *Mitigation*: Run PgBouncer as a database connection proxy, and reuse sessions.
-3. **Queue Ingestion Memory Pressures**: `pandas.read_csv()` loads the entire file into memory. For large datasets, this can lead to Out of Memory (OOM) worker restarts.
-   - *Mitigation*: Stream files or process them in chunks (`chunksize` parameter in pandas), yielding batches to Celery workers.
+| Decision | Rationale |
+|----------|-----------|
+| **Celery idempotency guard** | `if job.status in ("completed", "processing"): return` — prevents Celery retries from re-processing jobs |
+| **Redis for progress** | Lightweight polling without polling the database; keys expire in 24 hours |
+| **Job-scoped anomaly detection** | Median computed only on current job's rows — avoids cross-job contamination |
+| **Alembic-only migrations** | `Base.metadata.create_all` is never used; schema is versioned and reproducible |
+| **acks_late=True** | Tasks are acknowledged only after completion — prevents silent data loss on worker crash |
+
+---
+
+## Scalability Notes
+
+1. **Worker saturation** — Increase concurrency with `--concurrency=N`; add a Celery rate limiter for LLM API calls
+2. **DB connection pools** — Add PgBouncer in front of PostgreSQL for connection multiplexing
+3. **Large CSV memory** — Switch `parse_and_validate_csv` to `pandas.read_csv(chunksize=5000)` for streaming ingestion
 
 ---
 
 ## Future Improvements
 
-1. **Dead Letter Queues (DLQ)**: Queue permanently failing jobs separately to prevent queue blockages and enable retry audits.
-2. **Chunk-Level Processing (Celery Chords)**: Break a single job into 5,000-row chunks, run them in parallel on multiple worker nodes, and combine results in a chord callback.
-3. **Optimistic Locking**: Prevent race conditions if multiple tasks attempt to update the same account median calculation concurrently.
+1. **Dead Letter Queues** — Route permanently failing jobs to a DLQ for audit and manual replay
+2. **Celery Chords** — Parallelize chunk-level processing across worker nodes, merge via chord callback
+3. **Optimistic Locking** — Prevent race conditions if concurrent tasks touch the same account's median

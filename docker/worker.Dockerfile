@@ -1,6 +1,7 @@
 FROM python:3.11-slim
 
 WORKDIR /workspace
+ENV PYTHONPATH=/workspace
 
 # Install standard compilation dependencies for psycopg2 and other packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
